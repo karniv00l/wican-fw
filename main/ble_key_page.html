@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WiCAN BLE key</title>
+<style>
+:root { --primary:#24478f; --bg:#f0f2f5; --card:#fff; --muted:#6c757d; }
+* { box-sizing:border-box; }
+body { font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;
+  background:var(--bg); color:#333; margin:0; padding:1rem; line-height:1.5; }
+main { max-width:480px; margin:0 auto; }
+.card { background:var(--card); border-radius:12px; padding:1.25rem;
+  box-shadow:0 2px 8px rgba(0,0,0,.08); margin-bottom:1rem; }
+h1 { font-size:1.35rem; margin:0 0 .5rem; color:var(--primary); }
+p { margin:.5rem 0; }
+.muted { color:var(--muted); font-size:.92rem; }
+#keyGrouped { font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+  font-size:1.05rem; word-break:break-all; background:#f7f8fa;
+  border:1px solid #e2e6ea; border-radius:8px; padding:.9rem; margin:.75rem 0; }
+#qrBox { display:flex; justify-content:center; margin:1rem 0; }
+#qrBox canvas, #qrBox table { border:8px solid #fff; box-shadow:0 0 0 1px #e2e6ea; }
+.actions { display:flex; flex-wrap:wrap; gap:.5rem; margin-top:.75rem; }
+button, a.btn { appearance:none; border:none; border-radius:8px; padding:.65rem 1rem;
+  font-size:.95rem; font-weight:600; cursor:pointer; text-decoration:none;
+  display:inline-block; text-align:center; }
+button.primary, a.btn.primary { background:var(--primary); color:#fff; }
+button.secondary { background:#e9ecef; color:#333; }
+button:disabled { opacity:.6; cursor:not-allowed; }
+#status { min-height:1.25rem; font-size:.9rem; margin-top:.5rem; }
+.ok { color:#0a7a3d; }
+.err { color:#b00020; }
+a.link { color:var(--primary); }
+</style>
+</head>
+<body>
+<main>
+  <div class="card">
+    <h1>BLE access key</h1>
+    <p class="muted">Scan the QR code with your companion app, or copy the key below. No typing needed if the app fetches it over Wi‑Fi during setup.</p>
+    <div id="qrBox" aria-label="QR code for BLE key"></div>
+    <div id="keyGrouped">Loading…</div>
+    <div class="actions">
+      <button class="primary" id="copyBtn" type="button" disabled>Copy key</button>
+      <button class="secondary" id="copyUriBtn" type="button" disabled>Copy setup link</button>
+    </div>
+    <div id="status"></div>
+  </div>
+  <div class="card">
+    <p class="muted"><strong>App setup:</strong> connect to this dongle’s Wi‑Fi AP — a companion app can read <code>/ble_key.json</code> automatically (phones and Android head units on the same Wi‑Fi).</p>
+    <p class="muted"><strong>Manual entry:</strong> use the grouped code above (8 blocks of 4 characters) if you must type it.</p>
+    <p><a class="link" href="/ble_key?regen=1" onclick="return confirm('Regenerate key? Every app using this dongle must be updated.')">Regenerate key</a>
+       · <a class="link" href="/">Back to config</a></p>
+  </div>
+</main>
+<script src="/ble_qr.js"></script>
+<script>
+(function () {
+  var keyHex = '';
+  var pairUri = '';
+  var keyGroupedEl = document.getElementById('keyGrouped');
+  var copyBtn = document.getElementById('copyBtn');
+  var copyUriBtn = document.getElementById('copyUriBtn');
+  var statusEl = document.getElementById('status');
+
+  function setStatus(msg, ok) {
+    statusEl.textContent = msg;
+    statusEl.className = ok ? 'ok' : 'err';
+  }
+
+  function renderQr(text) {
+    var box = document.getElementById('qrBox');
+    box.innerHTML = '';
+    if (typeof qrcode === 'undefined') {
+      setStatus('QR library not loaded — key below is still valid.', false);
+      return;
+    }
+    try {
+      var qr = qrcode(0, 'M');
+      qr.addData(text);
+      qr.make();
+      // createImgTag returns an HTML string, not a DOM node
+      box.innerHTML = qr.createImgTag(5, 8);
+    } catch (e) {
+      setStatus('Key loaded; QR render failed: ' + e.message, false);
+    }
+  }
+
+  function copyText(text, label) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () {
+        setStatus(label + ' copied.', true);
+      }).catch(function () { fallbackCopy(text, label); });
+    } else {
+      fallbackCopy(text, label);
+    }
+  }
+
+  function fallbackCopy(text, label) {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.left = '-9999px';
+    document.body.appendChild(ta);
+    ta.select();
+    try {
+      document.execCommand('copy');
+      setStatus(label + ' copied.', true);
+    } catch (e) {
+      setStatus('Copy failed — select the key and copy manually.', false);
+    }
+    document.body.removeChild(ta);
+  }
+
+  copyBtn.addEventListener('click', function () { copyText(keyHex, 'Key'); });
+  copyUriBtn.addEventListener('click', function () { copyText(pairUri, 'Setup link'); });
+
+  fetch('/ble_key.json').then(function (r) {
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  }).then(function (data) {
+    keyHex = data.key || '';
+    pairUri = data.pair_uri || ('wican://ble-key/' + keyHex);
+    keyGroupedEl.textContent = data.key_grouped || keyHex;
+    copyBtn.disabled = !keyHex;
+    copyUriBtn.disabled = !pairUri;
+    renderQr(pairUri);
+    if (!statusEl.textContent) {
+      setStatus('Key loaded.', true);
+    }
+  }).catch(function (e) {
+    keyGroupedEl.textContent = 'Failed to load key.';
+    setStatus('Could not load /ble_key.json: ' + e.message, false);
+  });
+})();
+</script>
+</body>
+</html>

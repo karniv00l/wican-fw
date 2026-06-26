@@ -23,6 +23,7 @@
 #include <esp_event.h>
 #include <esp_log.h>
 #include <esp_system.h>
+#include "esp_random.h"
 #include <sys/param.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -96,6 +97,10 @@ static const char logo[] = {"<svg data-bbox=\"8.091 171.26 470.264 169.479\" ove
 
 extern const unsigned char homepage_start[] asm("_binary_homepage_full_html_start");
 extern const unsigned char homepage_end[]   asm("_binary_homepage_full_html_end");
+extern const unsigned char ble_key_page_start[] asm("_binary_ble_key_page_html_start");
+extern const unsigned char ble_key_page_end[]   asm("_binary_ble_key_page_html_end");
+extern const unsigned char ble_qr_min_js_start[] asm("_binary_ble_qr_min_js_start");
+extern const unsigned char ble_qr_min_js_end[]   asm("_binary_ble_qr_min_js_end");
 
 static char can_datarate_str[11][7] = {
 								"5k",
@@ -220,6 +225,95 @@ int config_server_ble_pass(void)
 		return ble_pass;
 	}
 	return -1;
+}
+
+/* ---- BLE application-layer auth key (challenge-response shared secret) ----
+ * A random 128-bit key persisted as its own file on the config filesystem. It gates the BLE
+ * CAN data path (see ble.c): the client must prove knowledge of this key via HMAC-SHA256 over a
+ * per-connection nonce before any CAN frame is injected or telemetry is delivered. It is separate
+ * from the JSON config on purpose (binary secret, independent lifecycle, no parse-path churn). */
+#define BLE_AUTH_KEY_PATH   FS_MOUNT_POINT"/ble_key.bin"
+
+static void ble_key_generate_and_store(uint8_t key[BLE_AUTH_KEY_LEN])
+{
+	esp_fill_random(key, BLE_AUTH_KEY_LEN);
+	FILE *f = fopen(BLE_AUTH_KEY_PATH, "wb");
+	if(f != NULL)
+	{
+		fwrite(key, 1, BLE_AUTH_KEY_LEN, f);
+		fclose(f);
+		ESP_LOGI(TAG, "Generated new BLE auth key");
+	}
+	else
+	{
+		ESP_LOGE(TAG, "Failed to persist BLE auth key");
+	}
+}
+
+void config_server_get_ble_key(uint8_t key[BLE_AUTH_KEY_LEN])
+{
+	FILE *f = fopen(BLE_AUTH_KEY_PATH, "rb");
+	if(f != NULL)
+	{
+		size_t n = fread(key, 1, BLE_AUTH_KEY_LEN, f);
+		fclose(f);
+		if(n == BLE_AUTH_KEY_LEN)
+		{
+			return;
+		}
+	}
+	/* Missing or corrupt -> generate a fresh key on first use. */
+	ble_key_generate_and_store(key);
+}
+
+void config_server_regenerate_ble_key(void)
+{
+	uint8_t key[BLE_AUTH_KEY_LEN];
+	ble_key_generate_and_store(key);
+}
+
+void config_server_get_ble_key_hex(char *out, size_t out_size)
+{
+	uint8_t key[BLE_AUTH_KEY_LEN];
+	static const char hexd[] = "0123456789abcdef";
+	size_t i;
+
+	if(out == NULL || out_size == 0)
+	{
+		return;
+	}
+	config_server_get_ble_key(key);
+	for(i = 0; i < BLE_AUTH_KEY_LEN && ((2 * i) + 2) < out_size; i++)
+	{
+		out[2 * i]       = hexd[key[i] >> 4];
+		out[(2 * i) + 1] = hexd[key[i] & 0x0F];
+	}
+	out[2 * i] = '\0';
+}
+
+static void config_server_format_ble_key_grouped(const char *key_hex, char *out, size_t out_size)
+{
+	size_t i, o = 0;
+
+	if(out == NULL || out_size == 0 || key_hex == NULL)
+	{
+		return;
+	}
+	for(i = 0; i < (BLE_AUTH_KEY_LEN * 2) && key_hex[i] != '\0'; i++)
+	{
+		if(i > 0 && (i % 4) == 0 && o + 1 < out_size)
+		{
+			out[o++] = '-';
+		}
+		if(o + 1 < out_size)
+		{
+			out[o++] = key_hex[i];
+		}
+	}
+	if(o < out_size)
+	{
+		out[o] = '\0';
+	}
 }
 
 char *config_server_get_sta_pass(void)
@@ -498,6 +592,54 @@ static esp_err_t load_canflt_handler(httpd_req_t *req)
 	}
 
     return ESP_OK;
+}
+
+/* JSON API for app/head-unit provisioning (no typing). GET /ble_key.json */
+static esp_err_t ble_key_json_handler(httpd_req_t *req)
+{
+	char key_hex[BLE_AUTH_KEY_LEN * 2 + 1];
+	char key_grouped[(BLE_AUTH_KEY_LEN * 2) + 8];
+	char pair_uri[sizeof("wican://ble-key/") + (BLE_AUTH_KEY_LEN * 2)];
+	char json[192];
+
+	config_server_get_ble_key_hex(key_hex, sizeof(key_hex));
+	config_server_format_ble_key_grouped(key_hex, key_grouped, sizeof(key_grouped));
+	snprintf(pair_uri, sizeof(pair_uri), "wican://ble-key/%s", key_hex);
+	snprintf(json, sizeof(json),
+		"{\"v\":1,\"key\":\"%s\",\"key_grouped\":\"%s\",\"pair_uri\":\"%s\"}",
+		key_hex, key_grouped, pair_uri);
+
+	httpd_resp_set_type(req, "application/json");
+	httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+	return ESP_OK;
+}
+
+static esp_err_t ble_qr_js_handler(httpd_req_t *req)
+{
+	const size_t js_size = ble_qr_min_js_end - ble_qr_min_js_start;
+
+	httpd_resp_set_type(req, "application/javascript");
+	return httpd_resp_send(req, (const char *)ble_qr_min_js_start, js_size);
+}
+
+/* QR + grouped key page. GET /ble_key?regen=1 rotates the key. Config web server (AP) only. */
+static esp_err_t ble_key_handler(httpd_req_t *req)
+{
+	char query[32];
+	char param[8];
+	const size_t page_size = ble_key_page_end - ble_key_page_start;
+
+	if(httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK)
+	{
+		if(httpd_query_key_value(query, "regen", param, sizeof(param)) == ESP_OK && strcmp(param, "1") == 0)
+		{
+			config_server_regenerate_ble_key();
+			ESP_LOGW(TAG, "BLE auth key regenerated via web UI");
+		}
+	}
+
+	httpd_resp_set_type(req, "text/html");
+	return httpd_resp_send(req, (const char *)ble_key_page_start, page_size);
 }
 
 static esp_err_t load_pid_auto_handler(httpd_req_t *req)
@@ -1471,6 +1613,24 @@ static const httpd_uri_t load_canflt_uri = {
      * context to demonstrate it's usage */
     .user_ctx  = NULL
 };
+static const httpd_uri_t ble_key_uri = {
+    .uri       = "/ble_key",
+    .method    = HTTP_GET,
+    .handler   = ble_key_handler,
+    .user_ctx  = NULL
+};
+static const httpd_uri_t ble_key_json_uri = {
+    .uri       = "/ble_key.json",
+    .method    = HTTP_GET,
+    .handler   = ble_key_json_handler,
+    .user_ctx  = NULL
+};
+static const httpd_uri_t ble_qr_js_uri = {
+    .uri       = "/ble_qr.js",
+    .method    = HTTP_GET,
+    .handler   = ble_qr_js_handler,
+    .user_ctx  = NULL
+};
 static const httpd_uri_t load_pid_auto_uri = {
     .uri       = "/load_auto_pid",
     .method    = HTTP_GET,
@@ -2264,6 +2424,9 @@ static httpd_handle_t config_server_init(void)
 		httpd_register_uri_handler(server, &system_reboot);
 		httpd_register_uri_handler(server, &store_canflt_uri);
 		httpd_register_uri_handler(server, &load_canflt_uri);
+		httpd_register_uri_handler(server, &ble_key_uri);
+		httpd_register_uri_handler(server, &ble_key_json_uri);
+		httpd_register_uri_handler(server, &ble_qr_js_uri);
 		httpd_register_uri_handler(server, &store_auto_data_uri);
 		httpd_register_uri_handler(server, &load_pid_auto_uri);
 		httpd_register_uri_handler(server, &load_pid_auto_conf_uri);
@@ -2303,6 +2466,9 @@ void config_server_restart(void)
 		httpd_register_uri_handler(server, &system_reboot);
 		httpd_register_uri_handler(server, &store_canflt_uri);
 		httpd_register_uri_handler(server, &load_canflt_uri);
+		httpd_register_uri_handler(server, &ble_key_uri);
+		httpd_register_uri_handler(server, &ble_key_json_uri);
+		httpd_register_uri_handler(server, &ble_qr_js_uri);
 		httpd_register_uri_handler(server, &store_auto_data_uri);
 		httpd_register_uri_handler(server, &load_pid_auto_uri);
 		httpd_register_uri_handler(server, &load_pid_auto_conf_uri);

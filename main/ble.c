@@ -44,6 +44,8 @@
 
 #include "esp_log.h"
 #include "esp_gatt_common_api.h"
+#include "esp_random.h"
+#include "mbedtls/md.h"
 #include "types.h"
 #include "ble.h"
 #include "comm_server.h"
@@ -65,6 +67,11 @@ enum
     IDX_CHAR_C,
     IDX_CHAR_VAL_C,
 
+    /* Auth characteristic (0xFEE2): challenge-response gate for the CAN data path. */
+    IDX_CHAR_AUTH,
+    IDX_CHAR_VAL_AUTH,
+    IDX_CHAR_CFG_AUTH,
+
     HRS_IDX_NB,
 };
 
@@ -74,6 +81,20 @@ enum
 static uint8_t adv_config_done = 0;
 
 #define GATTS_TABLE_TAG "BLE"
+
+/* Open GATT: characteristics are accessible on an unencrypted link, no pairing/bonding required.
+ *
+ * Rationale: both MITM passkey pairing and "Just Works" (SC + bonding, IO_CAP_NONE) fail to
+ * complete against Apple (iOS/macOS CoreBluetooth) on this device. Pairing never finishes, so the
+ * first operation on an encrypted attribute (e.g. writing the CCCD to enable notifications on
+ * FEE1) fails with ATT 0x0F "Encryption is insufficient" (apple-code 15). Testing with a fully
+ * clean slate (device forgotten on the Apple side) reproduced the same failure. Dropping the
+ * encryption requirement gives a reliable connection and working RX/TX across nRF, iOS and macOS.
+ *
+ * Trade-off: the BLE link is unauthenticated and unencrypted, so any device in range can connect
+ * and read/write the CAN bridge. Acceptable here because this is a local, short-range diagnostic
+ * link; revisit if a working encrypted-pairing path against Apple is found. */
+#define BLE_CHAR_PERM   (ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE)
 
 #define HEART_PROFILE_NUM                         1
 #define HEART_PROFILE_APP_IDX                     0
@@ -107,7 +128,10 @@ static esp_ble_adv_params_t heart_rate_adv_params = {
     .adv_int_min        = 0x100,
     .adv_int_max        = 0x100,
     .adv_type           = ADV_TYPE_IND,
-    .own_addr_type      = BLE_ADDR_TYPE_RPA_PUBLIC,
+    /* Advertise with a stable public address so the central sees a consistent identity across
+     * address changes and power-cycles, making reconnect reliable. (A rotating RPA would only be
+     * resolvable by a peer that holds our IRK from a completed bond.) */
+    .own_addr_type      = BLE_ADDR_TYPE_PUBLIC,
     .channel_map        = ADV_CHNL_ALL,
     .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
 };
@@ -196,7 +220,7 @@ static QueueHandle_t *xBle_TX_Queue = NULL, *xBle_RX_Queue = NULL;
 //66 33 22 11 BB 00 00 00 11 00 00 00 33 00 00 00 A4 3C D9 49
 static const uint16_t GATTS_SERVICE_UUID_TEST      = 0xfee0;
 static const uint16_t GATTS_CHAR_UUID_TEST_A       = 0xfee1;
-//static const uint16_t GATTS_CHAR_UUID_TEST_B       = 0xfee2;
+static const uint16_t GATTS_CHAR_UUID_AUTH         = 0xfee2;
 static const uint16_t GATTS_CHAR_UUID_TEST_C       = 0xfee3;
 
 static const uint16_t primary_service_uuid         = ESP_GATT_UUID_PRI_SERVICE;
@@ -205,10 +229,14 @@ static const uint16_t character_client_config_uuid = ESP_GATT_UUID_CHAR_CLIENT_C
 //static const uint8_t char_prop_read                = ESP_GATT_CHAR_PROP_BIT_READ;
 //static const uint8_t char_prop_read_notify_ind         = ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_NOTIFY|ESP_GATT_CHAR_PROP_BIT_INDICATE;
 //static const uint8_t char_prop_write               = ESP_GATT_CHAR_PROP_BIT_WRITE;
-static const uint8_t char_prop_read_write_notify   = ESP_GATT_CHAR_PROP_BIT_WRITE | ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_NOTIFY;
+static const uint8_t char_prop_read_write_notify   = ESP_GATT_CHAR_PROP_BIT_WRITE | ESP_GATT_CHAR_PROP_BIT_WRITE_NR | ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_NOTIFY;
 //static const uint8_t char_prop_read_write   = ESP_GATT_CHAR_PROP_BIT_WRITE | ESP_GATT_CHAR_PROP_BIT_READ;
 static const uint8_t heart_measurement_ccc[2]      = {0x00, 0x00};
 static const uint8_t char_value[20]                 = {0x11, 0x22, 0x33, 0x44};
+/* Backing store for the auth characteristic (FEE2): holds the current nonce on read, and receives
+ * the client's HMAC response on write. Sized for the 32-byte response. */
+static uint8_t ble_auth_attr[32]                   = {0};
+static uint8_t ble_auth_ccc[2]                     = {0x00, 0x00};
 #define CHAR_DECLARATION_SIZE       (sizeof(uint8_t))
 #define SVC_INST_ID                 0
 static uint16_t spp_mtu_size = 23;
@@ -219,6 +247,19 @@ static esp_gatt_if_t spp_gatts_if = 0xff;
 // Since the default MTU size is 23 this is initially set to 20
 static uint16_t ble_max_data_size = 20;
 static bool is_connected = false;
+
+/* ---- BLE application-layer auth (challenge-response gate for the CAN data path) ---- */
+#define BLE_AUTH_NONCE_LEN   16
+#define BLE_AUTH_RESP_LEN    32   /* HMAC-SHA256 output */
+#define BLE_AUTH_TIMEOUT_US  (10 * 1000000LL)
+#define BLE_AUTH_MAX_FAILS   5
+static const char BLE_AUTH_LABEL[] = "WICAN-BLE-AUTH-v1"; /* domain separation, no NUL in HMAC */
+static uint8_t ble_auth_key[BLE_AUTH_KEY_LEN];
+static bool ble_auth_key_loaded = false;
+static uint8_t ble_auth_nonce[BLE_AUTH_NONCE_LEN];
+static volatile bool ble_authed = false;
+static int64_t ble_auth_deadline = 0;
+static uint8_t ble_auth_fail_count = 0;
 static uint8_t test1[] = {0x66 ,0x33 ,0x22 ,0x11 ,0xBB ,0x00 ,0x00 ,0x00 ,0x11 ,0x00 ,0x00 ,0x00 ,0x33 ,0x00 ,0x00 ,0x00 ,0xA4 ,0x3C ,0xD9 ,0x49};
 /* Full Database Description - Used to add attributes into the database */
 static const esp_gatts_attr_db_t gatt_db[HRS_IDX_NB] =
@@ -240,12 +281,12 @@ static const esp_gatts_attr_db_t gatt_db[HRS_IDX_NB] =
 	    // be the max MTU supported by BLE.
 	    /* Characteristic Value */
 	    [IDX_CHAR_VAL_A] =
-			{{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *)&GATTS_CHAR_UUID_TEST_A, ESP_GATT_PERM_READ_ENC_MITM | ESP_GATT_PERM_WRITE_ENC_MITM,
+			{{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *)&GATTS_CHAR_UUID_TEST_A, BLE_CHAR_PERM,
 	      GATTS_DEMO_CHAR_VAL_LEN_MAX, sizeof(test1), (uint8_t *)test1}},
 
 	    /* Client Characteristic Configuration Descriptor */
 	    [IDX_CHAR_CFG_A]  =
-			{{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *)&character_client_config_uuid, ESP_GATT_PERM_READ_ENC_MITM | ESP_GATT_PERM_WRITE_ENC_MITM,
+			{{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *)&character_client_config_uuid, BLE_CHAR_PERM,
 	      sizeof(uint16_t), sizeof(heart_measurement_ccc), (uint8_t *)heart_measurement_ccc}},
 
 		/* Characteristic Declaration */
@@ -255,8 +296,23 @@ static const esp_gatts_attr_db_t gatt_db[HRS_IDX_NB] =
 
 		/* Characteristic Value */
 		[IDX_CHAR_VAL_C]  =
-			{{ESP_GATT_RSP_BY_APP}, {ESP_UUID_LEN_16, (uint8_t *)&GATTS_CHAR_UUID_TEST_C, ESP_GATT_PERM_READ_ENC_MITM | ESP_GATT_PERM_WRITE_ENC_MITM,
+			{{ESP_GATT_RSP_BY_APP}, {ESP_UUID_LEN_16, (uint8_t *)&GATTS_CHAR_UUID_TEST_C, BLE_CHAR_PERM,
 		  GATTS_DEMO_CHAR_VAL_LEN_MAX, sizeof(char_value), (uint8_t *)char_value}},
+
+		/* Auth characteristic (FEE2): READ returns the per-connection nonce, WRITE takes the
+		 * client's HMAC-SHA256 response, NOTIFY reports the 1-byte auth result. Kept open (no
+		 * encryption) since it IS the auth channel; the secret is proven via HMAC, never sent. */
+		[IDX_CHAR_AUTH]     =
+		{{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *)&character_declaration_uuid, ESP_GATT_PERM_READ,
+		  CHAR_DECLARATION_SIZE, CHAR_DECLARATION_SIZE, (uint8_t *)&char_prop_read_write_notify}},
+
+		[IDX_CHAR_VAL_AUTH] =
+			{{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *)&GATTS_CHAR_UUID_AUTH, ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
+		  sizeof(ble_auth_attr), sizeof(ble_auth_attr), (uint8_t *)ble_auth_attr}},
+
+		[IDX_CHAR_CFG_AUTH] =
+			{{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *)&character_client_config_uuid, ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
+		  sizeof(uint16_t), sizeof(ble_auth_ccc), (uint8_t *)ble_auth_ccc}},
 
 };
 
@@ -478,6 +534,86 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
     }
 }
 
+/* Constant-time comparison to avoid leaking match position via timing. */
+static int ble_auth_ct_memcmp(const uint8_t *a, const uint8_t *b, size_t n)
+{
+	uint8_t diff = 0;
+	for(size_t i = 0; i < n; i++)
+	{
+		diff |= (uint8_t)(a[i] ^ b[i]);
+	}
+	return diff;
+}
+
+/* expected = HMAC-SHA256(key, LABEL || nonce). Returns true on success. */
+static bool ble_auth_compute_expected(uint8_t out[BLE_AUTH_RESP_LEN])
+{
+	const mbedtls_md_info_t *info;
+	mbedtls_md_context_t ctx;
+	int rc;
+
+	if(!ble_auth_key_loaded)
+	{
+		return false;
+	}
+	info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+	if(info == NULL)
+	{
+		return false;
+	}
+	mbedtls_md_init(&ctx);
+	rc = mbedtls_md_setup(&ctx, info, 1 /* HMAC */);
+	if(rc == 0) rc = mbedtls_md_hmac_starts(&ctx, ble_auth_key, sizeof(ble_auth_key));
+	if(rc == 0) rc = mbedtls_md_hmac_update(&ctx, (const uint8_t *)BLE_AUTH_LABEL, sizeof(BLE_AUTH_LABEL) - 1);
+	if(rc == 0) rc = mbedtls_md_hmac_update(&ctx, ble_auth_nonce, sizeof(ble_auth_nonce));
+	if(rc == 0) rc = mbedtls_md_hmac_finish(&ctx, out);
+	mbedtls_md_free(&ctx);
+	return (rc == 0);
+}
+
+/* Start a fresh challenge for a new connection: new random nonce, reset auth state, publish the
+ * nonce as the FEE2 read value, and arm the auth timeout. */
+static void ble_auth_reset_session(void)
+{
+	ble_authed = false;
+	ble_auth_fail_count = 0;
+	esp_fill_random(ble_auth_nonce, sizeof(ble_auth_nonce));
+	esp_ble_gatts_set_attr_value(profile_handle_table[IDX_CHAR_VAL_AUTH],
+								 sizeof(ble_auth_nonce), ble_auth_nonce);
+	ble_auth_deadline = esp_timer_get_time() + BLE_AUTH_TIMEOUT_US;
+}
+
+/* Verify the client's response written to FEE2 and notify the 1-byte result. */
+static void ble_auth_handle_response(const uint8_t *resp, uint16_t len)
+{
+	uint8_t expected[BLE_AUTH_RESP_LEN];
+	uint8_t status;
+
+	if(len == BLE_AUTH_RESP_LEN && ble_auth_compute_expected(expected) &&
+	   ble_auth_ct_memcmp(resp, expected, BLE_AUTH_RESP_LEN) == 0)
+	{
+		ble_authed = true;
+		status = 0x01;
+		ESP_LOGI(GATTS_TABLE_TAG, "BLE auth OK");
+		esp_ble_gatts_send_indicate(spp_gatts_if, spp_conn_id,
+									profile_handle_table[IDX_CHAR_VAL_AUTH], 1, &status, false);
+	}
+	else
+	{
+		ble_authed = false;
+		status = 0x00;
+		ble_auth_fail_count++;
+		ESP_LOGW(GATTS_TABLE_TAG, "BLE auth FAIL (%d)", ble_auth_fail_count);
+		esp_ble_gatts_send_indicate(spp_gatts_if, spp_conn_id,
+									profile_handle_table[IDX_CHAR_VAL_AUTH], 1, &status, false);
+		if(ble_auth_fail_count >= BLE_AUTH_MAX_FAILS)
+		{
+			ESP_LOGW(GATTS_TABLE_TAG, "BLE auth: too many failures, closing connection");
+			esp_ble_gatts_close(spp_gatts_if, spp_conn_id);
+		}
+	}
+}
+
 static void gatts_profile_event_handler(esp_gatts_cb_event_t event,
                                         esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param)
 {
@@ -487,8 +623,9 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event,
     switch (event) {
         case ESP_GATTS_REG_EVT:
             esp_ble_gap_set_device_name((const char*)dev_name);
-            //generate a resolvable random address
-            esp_ble_gap_config_local_privacy(true);
+            // Disable local privacy so we advertise with the stable public address
+            // (see own_addr_type note above). SET_LOCAL_PRIVACY_COMPLETE_EVT still fires.
+            esp_ble_gap_config_local_privacy(false);
             esp_ble_gatts_create_attr_tab(gatt_db, gatts_if,
                                       HRS_IDX_NB, HEART_RATE_SVC_INST_ID);
             break;
@@ -509,12 +646,25 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event,
             ESP_LOGI(GATTS_TABLE_TAG, "ESP_GATTS_WRITE_EVT, write value:");
             esp_log_buffer_hex(GATTS_TABLE_TAG, param->write.value, param->write.len);
 
-            if(profile_handle_table[IDX_CHAR_VAL_A] == param->write.handle)
+            if(profile_handle_table[IDX_CHAR_VAL_AUTH] == param->write.handle)
             {
-				memcpy(rx_buffer.ucElement, param->write.value, param->write.len);
-				rx_buffer.dev_channel = DEV_BLE;
-				rx_buffer.usLen = param->write.len;
-				xQueueSend(*xBle_RX_Queue, ( void * ) &rx_buffer, portMAX_DELAY );
+				/* Client's challenge-response; verify before unlocking the CAN path. */
+				ble_auth_handle_response(param->write.value, param->write.len);
+            }
+            else if(profile_handle_table[IDX_CHAR_VAL_A] == param->write.handle)
+            {
+				/* Gate CAN injection: drop writes until the client has authenticated. */
+				if(ble_authed)
+				{
+					memcpy(rx_buffer.ucElement, param->write.value, param->write.len);
+					rx_buffer.dev_channel = DEV_BLE;
+					rx_buffer.usLen = param->write.len;
+					xQueueSend(*xBle_RX_Queue, ( void * ) &rx_buffer, portMAX_DELAY );
+				}
+				else
+				{
+					ESP_LOGW(GATTS_TABLE_TAG, "Dropped BLE write: not authenticated");
+				}
             }
             else if(profile_handle_table[IDX_CHAR_VAL_C] == param->write.handle)
             {
@@ -563,15 +713,20 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event,
     	    spp_conn_id = param->connect.conn_id;
     	    spp_gatts_if = gatts_if;
     	    is_connected = true;
+    	    /* New connection -> fresh challenge; nothing flows until the client authenticates. */
+    	    ble_auth_reset_session();
     	    xEventGroupSetBits(s_ble_event_group, BLE_CONNECTED_BIT);
     	    gpio_set_level(conn_led, 0);
-            /* start security connect with peer device when receive the connect event sent by the master */
-            esp_ble_set_encryption(param->connect.remote_bda, ESP_BLE_SEC_ENCRYPT_MITM);
+            /* Open GATT (see BLE_CHAR_PERM): do NOT request link encryption here. Sending a security
+             * request makes Apple attempt pairing, which fails to complete on this device and leaves
+             * the link in a half-secured state. With no encrypted attributes there is nothing to
+             * pair for, so we skip esp_ble_set_encryption() entirely. */
             break;
         case ESP_GATTS_DISCONNECT_EVT:
             ESP_LOGI(GATTS_TABLE_TAG, "ESP_GATTS_DISCONNECT_EVT, disconnect reason 0x%x", param->disconnect.reason);
 //            wifi_network_restart();
 //        	config_server_restart();
+            ble_authed = false;
             is_connected = false;
             gpio_set_level(conn_led, 1);
             /* start advertising again when missing the connect */
@@ -667,6 +822,25 @@ static void ble_task(void *pvParameters)
 									pdFALSE,
 									portMAX_DELAY);
 		//		ESP_LOGI(GATTS_TABLE_TAG, "BLE_CONNECTED_BIT");
+
+				/* Telemetry gate: withhold all CAN->host data until the client authenticates.
+				 * Drain (discard) queued frames so producers (can_rx_task) never block, and
+				 * disconnect if the handshake isn't completed within the timeout window. */
+				if(!ble_authed)
+				{
+					if(is_connected && esp_timer_get_time() > ble_auth_deadline)
+					{
+						ESP_LOGW(GATTS_TABLE_TAG, "BLE auth timeout, closing connection");
+						esp_ble_gatts_close(spp_gatts_if, spp_conn_id);
+					}
+					while(xQueueReceive(*xBle_TX_Queue, ( void * ) &tx_buffer, 0) == pdTRUE)
+					{
+						/* discard while unauthenticated */
+					}
+					ble_send_buf_len = 0;
+					vTaskDelay(pdMS_TO_TICKS(50));
+					continue;
+				}
 
 				xQueuePeek(*xBle_TX_Queue, ( void * ) &tx_buffer, portMAX_DELAY);
 		//		memcpy(ble_send_buf, tx_buffer.ucElement, tx_buffer.usLen);
@@ -814,8 +988,15 @@ void ble_init(QueueHandle_t *xTXp_Queue, QueueHandle_t *xRXp_Queue, uint8_t conn
 		strcpy((char*)dev_name, (char*)uid);
 		conn_led = connected_led;
 		ble_pass_key = passkey;
-		ESP_LOGW(GATTS_TABLE_TAG, "ble passkey: %lu", ble_pass_key);
+		/* Kept for logging/compatibility only. With Just Works pairing (ESP_IO_CAP_NONE) there is
+		 * no passkey exchange, so this value is not applied to the SMP security params. */
+		ESP_LOGW(GATTS_TABLE_TAG, "ble passkey (unused with Just Works pairing): %lu", ble_pass_key);
 	}
+
+	/* Load the application-layer auth key (generated + persisted on first use). Used to verify the
+	 * client's HMAC challenge-response before any CAN frame is injected or telemetry is delivered. */
+	config_server_get_ble_key(ble_auth_key);
+	ble_auth_key_loaded = true;
 
 	if(xBle_TX_Queue == NULL)
 	{
@@ -892,18 +1073,21 @@ void ble_init(QueueHandle_t *xTXp_Queue, QueueHandle_t *xRXp_Queue, uint8_t conn
         ESP_LOGE(GATTS_TABLE_TAG, "set local  MTU failed, error code = %x", local_mtu_ret);
     }
 	/* set the security iocap & auth_req & key size & init key response key parameters to the stack*/
-	esp_ble_auth_req_t auth_req = ESP_LE_AUTH_REQ_SC_MITM_BOND;     //bonding with peer device after authentication
-	esp_ble_io_cap_t iocap = ESP_IO_CAP_OUT;           //set the IO capability to No output No input
+	/* We ship an open GATT profile (see BLE_CHAR_PERM) so pairing is not required and the ESP never
+	 * initiates it. These SMP params are only a best-effort fallback for a client that explicitly
+	 * chooses to bond: "Just Works" (LE Secure Connections + bonding, NoInputNoOutput, no passkey).
+	 * They are intentionally non-MITM so no passkey dialog is ever shown. */
+	esp_ble_auth_req_t auth_req = ESP_LE_AUTH_REQ_SC_BOND;     //bond with peer, no MITM (Just Works)
+	esp_ble_io_cap_t iocap = ESP_IO_CAP_NONE;          //NoInputNoOutput -> Just Works if a peer pairs
 	uint8_t key_size = 16;      //the key size should be 7~16 bytes
 	uint8_t init_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
 	uint8_t rsp_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
-	//set static passkey
-//	uint32_t passkey = 123456;
-	uint8_t auth_option = ESP_BLE_ONLY_ACCEPT_SPECIFIED_AUTH_ENABLE;
+	/* Do NOT restrict to a specific auth mode; let the ESP accept the flags Apple negotiates. */
+	uint8_t auth_option = ESP_BLE_ONLY_ACCEPT_SPECIFIED_AUTH_DISABLE;
 	uint8_t oob_support = ESP_BLE_OOB_DISABLE;
 
-	esp_ble_gap_set_security_param(ESP_BLE_SM_CLEAR_STATIC_PASSKEY, &ble_pass_key, sizeof(uint32_t));
-	esp_ble_gap_set_security_param(ESP_BLE_SM_SET_STATIC_PASSKEY, &ble_pass_key, sizeof(uint32_t));
+	/* No static passkey: Just Works has no passkey exchange. The web-configured ble_pass_key is
+	 * intentionally not applied to the SMP params here. */
 	esp_ble_gap_set_security_param(ESP_BLE_SM_AUTHEN_REQ_MODE, &auth_req, sizeof(uint8_t));
 	esp_ble_gap_set_security_param(ESP_BLE_SM_IOCAP_MODE, &iocap, sizeof(uint8_t));
 	esp_ble_gap_set_security_param(ESP_BLE_SM_MAX_KEY_SIZE, &key_size, sizeof(uint8_t));

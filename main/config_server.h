@@ -23,10 +23,15 @@
 #pragma once
 #include "esp_tls_crypto.h"
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <esp_http_server.h>
 
 #define AP_MODE				0
 #define APSTA_MODE			1
+
+/* BLE application-layer auth shared key length (bytes). 16 = 128-bit. */
+#define BLE_AUTH_KEY_LEN	16
 
 #define CAN_5K				0
 #define CAN_10K				1
@@ -126,6 +131,9 @@ void config_server_get_sta_ip(char* ip);
 char *config_server_get_ap_pass(void);
 int8_t config_server_protocol(void);
 int config_server_ble_pass(void);
+void config_server_get_ble_key(uint8_t key[BLE_AUTH_KEY_LEN]);
+void config_server_regenerate_ble_key(void);
+void config_server_get_ble_key_hex(char *out, size_t out_size);
 int8_t config_server_get_sleep_config(void);
 //void config_server_set_ble_tempfn(char b);
 //char config_server_get_ble_tempfn(void);

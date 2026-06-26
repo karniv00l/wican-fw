@@ -1,5 +1,7 @@
 build/
 esp_idf_components/
+# clangd index cache
+.cache/
 # Prerequisites
 *.d
 

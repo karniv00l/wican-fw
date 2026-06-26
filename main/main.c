@@ -616,6 +616,9 @@ void app_main(void)
 	// pdFALSE, /* Don't wait for both bits, either bit will do. */
 	// portMAX_DELAY);/* Wait forever. */  
 	esp_log_level_set("*", ESP_LOG_NONE);
+	/* DEBUG: re-enable BLE logs so pairing/SMP results (AUTH_CMPL fail_reason) are visible
+	 * over the USB-Serial-JTAG console while diagnosing iOS pairing. Remove before release. */
+	esp_log_level_set("BLE", ESP_LOG_INFO);
 	// esp_log_level_set("autopid_parser", ESP_LOG_ERROR);
 	// esp_log_level_set("autopid_task", ESP_LOG_ERROR);
 	// esp_log_level_set("elm327_process_cmd", ESP_LOG_ERROR);
